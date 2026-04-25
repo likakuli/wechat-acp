@@ -160,6 +160,7 @@ export interface GetUploadUrlReq {
 export interface GetUploadUrlResp extends WeixinApiResp {
   upload_param?: string;
   thumb_upload_param?: string;
+  upload_full_url?: string;
 }
 
 export interface SendTypingReq {
