@@ -9,10 +9,12 @@ import type {
   BaseInfo,
   GetUpdatesResp,
   SendMessageReq,
+  SendMessageResp,
   GetUploadUrlReq,
   GetUploadUrlResp,
   SendTypingReq,
   GetConfigResp,
+  WeixinApiResp,
 } from "./types.js";
 
 const CHANNEL_VERSION = "1.0.2";
@@ -80,6 +82,15 @@ async function apiPost<T>(
   }
 }
 
+function assertOk<T extends WeixinApiResp>(resp: T, operation: string): T {
+  const ret = resp.ret;
+  const errcode = resp.errcode;
+  if ((ret !== undefined && ret !== 0) || (errcode !== undefined && errcode !== 0)) {
+    throw new Error(`${operation} failed: ret=${ret ?? ""} errcode=${errcode ?? ""} errmsg=${resp.errmsg ?? ""}`);
+  }
+  return resp;
+}
+
 export async function getUpdates(params: {
   baseUrl: string;
   token?: string;
@@ -99,8 +110,14 @@ export async function sendMessage(params: {
   baseUrl: string;
   token?: string;
   body: SendMessageReq;
-}): Promise<void> {
-  await apiPost(params.baseUrl, "ilink/bot/sendmessage", params.body as unknown as Record<string, unknown>, params.token);
+}): Promise<SendMessageResp> {
+  const resp = await apiPost<SendMessageResp>(
+    params.baseUrl,
+    "ilink/bot/sendmessage",
+    params.body as unknown as Record<string, unknown>,
+    params.token,
+  );
+  return assertOk(resp, "sendMessage");
 }
 
 export async function getUploadUrl(params: {
@@ -108,12 +125,13 @@ export async function getUploadUrl(params: {
   token?: string;
   body: GetUploadUrlReq;
 }): Promise<GetUploadUrlResp> {
-  return apiPost<GetUploadUrlResp>(
+  const resp = await apiPost<GetUploadUrlResp>(
     params.baseUrl,
     "ilink/bot/getuploadurl",
     params.body as unknown as Record<string, unknown>,
     params.token,
   );
+  return assertOk(resp, "getUploadUrl");
 }
 
 export async function getConfig(params: {
@@ -122,7 +140,7 @@ export async function getConfig(params: {
   ilinkUserId: string;
   contextToken?: string;
 }): Promise<GetConfigResp> {
-  return apiPost<GetConfigResp>(
+  const resp = await apiPost<GetConfigResp>(
     params.baseUrl,
     "ilink/bot/getconfig",
     {
@@ -132,6 +150,7 @@ export async function getConfig(params: {
     params.token,
     10_000,
   );
+  return assertOk(resp, "getConfig");
 }
 
 export async function sendTyping(params: {
@@ -139,13 +158,14 @@ export async function sendTyping(params: {
   token?: string;
   body: SendTypingReq;
 }): Promise<void> {
-  await apiPost(
+  const resp = await apiPost<WeixinApiResp>(
     params.baseUrl,
     "ilink/bot/sendtyping",
     params.body as unknown as Record<string, unknown>,
     params.token,
     10_000,
   );
+  assertOk(resp, "sendTyping");
 }
 
 export async function getBotQrcode(params: {

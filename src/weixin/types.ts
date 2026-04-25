@@ -125,10 +125,13 @@ export interface WeixinMessage {
   context_token?: string;
 }
 
-export interface GetUpdatesResp {
+export interface WeixinApiResp {
   ret?: number;
   errcode?: number;
   errmsg?: string;
+}
+
+export interface GetUpdatesResp extends WeixinApiResp {
   msgs?: WeixinMessage[];
   get_updates_buf?: string;
   longpolling_timeout_ms?: number;
@@ -137,6 +140,8 @@ export interface GetUpdatesResp {
 export interface SendMessageReq {
   msg?: WeixinMessage;
 }
+
+export interface SendMessageResp extends WeixinApiResp {}
 
 export interface GetUploadUrlReq {
   filekey?: string;
@@ -152,7 +157,7 @@ export interface GetUploadUrlReq {
   aeskey?: string;
 }
 
-export interface GetUploadUrlResp {
+export interface GetUploadUrlResp extends WeixinApiResp {
   upload_param?: string;
   thumb_upload_param?: string;
 }
@@ -163,6 +168,6 @@ export interface SendTypingReq {
   status: number;
 }
 
-export interface GetConfigResp {
+export interface GetConfigResp extends WeixinApiResp {
   typing_ticket?: string;
 }
