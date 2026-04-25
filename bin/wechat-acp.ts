@@ -49,6 +49,8 @@ Options:
   --idle-timeout <m>  Session idle timeout in minutes (default: 1440)
                       Use 0 to disable idle cleanup
   --max-sessions <n>  Max concurrent user sessions (default: 10)
+  --max-send-messages <n>
+                      Max WeChat sendmessage calls per reply (default: 10)
   --show-thoughts     Forward agent thinking to WeChat (default: off)
   -v, --verbose       Verbose logging
   -h, --help          Show this help
@@ -64,6 +66,7 @@ function parseArgs(argv: string[]): {
   configFile?: string;
   idleTimeout?: number;
   maxSessions?: number;
+  maxSendMessagesPerReply?: number;
   showThoughts: boolean;
   verbose: boolean;
   help: boolean;
@@ -108,6 +111,9 @@ function parseArgs(argv: string[]): {
         break;
       case "--max-sessions":
         result.maxSessions = parseInt(args[++i], 10);
+        break;
+      case "--max-send-messages":
+        result.maxSendMessagesPerReply = parseInt(args[++i], 10);
         break;
       case "--show-thoughts":
         result.showThoughts = true;
@@ -283,6 +289,14 @@ async function main(): Promise<void> {
     config.session.idleTimeoutMs = args.idleTimeout * 60_000;
   }
   if (args.maxSessions) config.session.maxConcurrentUsers = args.maxSessions;
+  if (args.maxSendMessagesPerReply !== undefined) {
+    if (!Number.isFinite(args.maxSendMessagesPerReply) || args.maxSendMessagesPerReply < 2) {
+      console.error("Error: invalid --max-send-messages value");
+      console.error("Use an integer value >= 2.");
+      process.exit(1);
+    }
+    config.wechat.maxSendMessagesPerReply = args.maxSendMessagesPerReply;
+  }
   if (args.showThoughts) config.agent.showThoughts = true;
   config.daemon.enabled = args.daemon;
 

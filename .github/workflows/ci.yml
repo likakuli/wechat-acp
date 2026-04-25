@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -16,4 +17,4 @@ jobs:
           node-version: lts/*
           cache: npm
       - run: npm ci
-      - run: npm run build
+      - run: npm test

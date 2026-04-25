@@ -66,6 +66,7 @@ export interface WeChatAcpConfig {
     baseUrl: string;
     cdnBaseUrl: string;
     botType: string;
+    maxSendMessagesPerReply: number;
   };
   agent: {
     preset?: string;
@@ -101,6 +102,7 @@ export function defaultConfig(): WeChatAcpConfig {
       baseUrl: "https://ilinkai.weixin.qq.com",
       cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
       botType: "3",
+      maxSendMessagesPerReply: 10,
     },
     agent: {
       preset: undefined,
