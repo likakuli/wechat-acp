@@ -5,13 +5,17 @@
  * One bridge = one WeChat bot account → many users → many agent sessions.
  */
 
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { login, loadToken, type TokenData } from "./weixin/auth.js";
 import { startMonitor } from "./weixin/monitor.js";
-import { sendTextMessage, splitText } from "./weixin/send.js";
+import { sendImageMessage, sendTextMessage, splitText } from "./weixin/send.js";
 import { sendTyping, getConfig } from "./weixin/api.js";
 import { TypingStatus, MessageType } from "./weixin/types.js";
 import type { WeixinMessage } from "./weixin/types.js";
 import { SessionManager } from "./acp/session.js";
+import type { AgentImage, AgentReply } from "./acp/client.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
 import { formatForWeChat } from "./adapter/outbound.js";
 import type { WeChatAcpConfig } from "./config.js";
@@ -66,7 +70,7 @@ export class WeChatAcpBridge {
       maxConcurrentUsers: this.config.session.maxConcurrentUsers,
       showThoughts: this.config.agent.showThoughts,
       log: this.log,
-      onReply: (userId, contextToken, text) => this.sendReply(userId, contextToken, text),
+      onReply: (userId, contextToken, reply) => this.sendReply(userId, contextToken, reply),
       sendTyping: (userId, contextToken) => this.sendTypingIndicator(userId, contextToken),
     });
     this.sessionManager.start();
@@ -123,20 +127,76 @@ export class WeChatAcpBridge {
     await this.sessionManager!.enqueue(userId, { prompt, contextToken });
   }
 
-  private async sendReply(userId: string, contextToken: string, text: string): Promise<void> {
-    const formatted = formatForWeChat(text);
-    const segments = splitText(formatted, TEXT_CHUNK_LIMIT);
+  private async sendReply(userId: string, contextToken: string, reply: AgentReply): Promise<void> {
+    const formatted = formatForWeChat(reply.text);
+    const segments = formatted.trim() ? splitText(formatted, TEXT_CHUNK_LIMIT) : [];
 
     for (const segment of segments) {
-      await sendTextMessage(userId, segment, {
+      const clientId = await sendTextMessage(userId, segment, {
         baseUrl: this.tokenData!.baseUrl,
         token: this.tokenData!.token,
         contextToken,
       });
+      this.log(`Sent text to ${userId}: ${segment.length} chars (${clientId})`);
+    }
+
+    for (const image of reply.images) {
+      try {
+        const resolved = await this.resolveAgentImage(image);
+        await sendImageMessage(userId, resolved, {
+          baseUrl: this.tokenData!.baseUrl,
+          cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+          token: this.tokenData!.token,
+          contextToken,
+        });
+        this.log(`Sent image to ${userId}: ${image.name ?? image.uri ?? image.mimeType}`);
+      } catch (err) {
+        this.log(`Failed to send image to ${userId}: ${String(err)}`);
+      }
     }
 
     // Cancel typing indicator after reply is sent
     this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+  }
+
+  private async resolveAgentImage(image: AgentImage): Promise<{ buffer: Buffer; mimeType?: string; name?: string }> {
+    if (image.data) {
+      return {
+        buffer: Buffer.from(stripDataPrefix(image.data), "base64"),
+        mimeType: image.mimeType,
+        name: image.name,
+      };
+    }
+
+    if (!image.uri) {
+      throw new Error("image has neither data nor uri");
+    }
+
+    const dataUri = parseDataUri(image.uri);
+    if (dataUri) {
+      return {
+        buffer: Buffer.from(dataUri.base64, "base64"),
+        mimeType: dataUri.mimeType ?? image.mimeType,
+        name: image.name,
+      };
+    }
+
+    if (/^https?:\/\//i.test(image.uri)) {
+      const res = await fetch(image.uri);
+      if (!res.ok) throw new Error(`image download failed: HTTP ${res.status}`);
+      return {
+        buffer: Buffer.from(await res.arrayBuffer()),
+        mimeType: res.headers.get("content-type") ?? image.mimeType,
+        name: image.name,
+      };
+    }
+
+    const filePath = resolveLocalPath(image.uri, this.config.agent.cwd);
+    return {
+      buffer: await fs.readFile(filePath),
+      mimeType: image.mimeType,
+      name: image.name ?? path.basename(filePath),
+    };
   }
 
   private async cancelTypingIndicator(userId: string, contextToken: string): Promise<void> {
@@ -212,4 +272,23 @@ export class WeChatAcpBridge {
     }
     return "[empty]";
   }
+}
+
+function stripDataPrefix(data: string): string {
+  const match = /^data:[^;]+;base64,([\s\S]*)$/i.exec(data.trim());
+  return match?.[1] ?? data;
+}
+
+function parseDataUri(uri: string): { mimeType?: string; base64: string } | null {
+  const match = /^data:([^;]+)?;base64,([\s\S]*)$/i.exec(uri.trim());
+  if (!match) return null;
+  return {
+    mimeType: match[1],
+    base64: match[2],
+  };
+}
+
+function resolveLocalPath(uri: string, cwd: string): string {
+  const filePath = uri.startsWith("file://") ? fileURLToPath(uri) : uri;
+  return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
 }

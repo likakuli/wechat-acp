@@ -7,7 +7,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import type * as acp from "@agentclientprotocol/sdk";
-import { WeChatAcpClient } from "./client.js";
+import { WeChatAcpClient, type AgentReply } from "./client.js";
 import { spawnAgent, killAgent, type AgentProcessInfo } from "./agent-manager.js";
 
 export interface PendingMessage {
@@ -35,7 +35,7 @@ export interface SessionManagerOpts {
   maxConcurrentUsers: number;
   showThoughts: boolean;
   log: (msg: string) => void;
-  onReply: (userId: string, contextToken: string, text: string) => Promise<void>;
+  onReply: (userId: string, contextToken: string, reply: AgentReply) => Promise<void>;
   sendTyping: (userId: string, contextToken: string) => Promise<void>;
 }
 
@@ -109,7 +109,7 @@ export class SessionManager {
 
     const client = new WeChatAcpClient({
       sendTyping: () => this.opts.sendTyping(userId, contextToken),
-      onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
+      onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, { text, images: [] }),
       log: (msg) => this.opts.log(`[${userId}] ${msg}`),
       showThoughts: this.opts.showThoughts,
     });
@@ -152,7 +152,7 @@ export class SessionManager {
         // Keep the ACP client instance stable because the connection is bound to it.
         session.client.updateCallbacks({
           sendTyping: () => this.opts.sendTyping(session.userId, pending.contextToken),
-          onThoughtFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
+          onThoughtFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, { text, images: [] }),
         });
 
         // Reset chunks for the new turn
@@ -170,19 +170,19 @@ export class SessionManager {
           });
 
           // Collect accumulated text
-          let replyText = await session.client.flush();
+          const reply = await session.client.flush();
 
           if (result.stopReason === "cancelled") {
-            replyText += "\n[cancelled]";
+            reply.text += "\n[cancelled]";
           } else if (result.stopReason === "refusal") {
-            replyText += "\n[agent refused to continue]";
+            reply.text += "\n[agent refused to continue]";
           }
 
-          this.opts.log(`[${session.userId}] Agent done (${result.stopReason}), reply ${replyText.length} chars`);
+          this.opts.log(`[${session.userId}] Agent done (${result.stopReason}), reply ${reply.text.length} chars, ${reply.images.length} images`);
 
           // Send reply back to WeChat
-          if (replyText.trim()) {
-            await this.opts.onReply(session.userId, pending.contextToken, replyText);
+          if (reply.text.trim() || reply.images.length > 0) {
+            await this.opts.onReply(session.userId, pending.contextToken, reply);
           }
         } catch (err) {
           this.opts.log(`[${session.userId}] Agent prompt error: ${String(err)}`);
@@ -199,7 +199,7 @@ export class SessionManager {
             await this.opts.onReply(
               session.userId,
               pending.contextToken,
-              `⚠️ Agent error: ${String(err)}`,
+              { text: `⚠️ Agent error: ${String(err)}`, images: [] },
             );
           } catch {
             // best effort
