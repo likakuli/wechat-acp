@@ -27,13 +27,13 @@ Bridge WeChat direct messages to any ACP-compatible AI agent.
 Start with a built-in agent preset:
 
 ```bash
-npx wechat-acp --agent copilot
+npx @likakuli/wechat-acp --agent copilot
 ```
 
 Or use a raw custom command:
 
 ```bash
-npx wechat-acp --agent "npx my-agent --acp"
+npx @likakuli/wechat-acp --agent "npx my-agent --acp"
 ```
 
 On first run, the bridge will:
@@ -48,7 +48,7 @@ On first run, the bridge will:
 List the bundled presets:
 
 ```bash
-npx wechat-acp agents
+npx @likakuli/wechat-acp agents
 ```
 
 Current presets:
@@ -80,16 +80,17 @@ Options:
 - `--config <file>`: load JSON config file
 - `--idle-timeout <minutes>`: session idle timeout, default `1440` (use `0` for unlimited)
 - `--max-sessions <count>`: maximum concurrent user sessions, default `10`
+- `--max-send-messages <count>`: maximum WeChat `sendmessage` calls per reply, default `10`
 - `--show-thoughts`: forward agent thinking to WeChat (default: off)
 - `-h, --help`: show help
 
 Examples:
 
 ```bash
-npx wechat-acp --agent copilot
-npx wechat-acp --agent claude --cwd D:\code\project
-npx wechat-acp --agent "npx @github/copilot --acp"
-npx wechat-acp --agent gemini --daemon
+npx @likakuli/wechat-acp --agent copilot
+npx @likakuli/wechat-acp --agent claude --cwd D:\code\project
+npx @likakuli/wechat-acp --agent "npx @github/copilot --acp"
+npx @likakuli/wechat-acp --agent gemini --daemon
 ```
 
 ## Configuration File
@@ -107,6 +108,9 @@ Example:
   "session": {
     "idleTimeoutMs": 86400000,
     "maxConcurrentUsers": 10
+  },
+  "wechat": {
+    "maxSendMessagesPerReply": 10
   }
 }
 ```

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Forward images returned by ACP agents back to WeChat
+- Upload and send image messages through the WeChat iLink CDN flow
+- Validate iLink business response codes before treating API calls as successful
+- Add detailed send diagnostics for iLink message failures
+- Limit outbound WeChat `sendmessage` calls per reply with configurable overflow handling
+
 ## 0.1.2
 
 - Add `--show-thoughts` flag to forward agent thinking to WeChat (off by default)
