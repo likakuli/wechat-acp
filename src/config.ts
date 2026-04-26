@@ -80,6 +80,8 @@ export interface WeChatAcpConfig {
   session: {
     idleTimeoutMs: number;
     maxConcurrentUsers: number;
+    messageBatchDelayMs: number;
+    textMessageBatchDelayMs?: number;
   };
   daemon: {
     enabled: boolean;
@@ -115,6 +117,7 @@ export function defaultConfig(): WeChatAcpConfig {
     session: {
       idleTimeoutMs: 1440 * 60_000, // 24 hours
       maxConcurrentUsers: 10,
+      messageBatchDelayMs: 2500,
     },
     daemon: {
       enabled: false,
@@ -132,7 +135,7 @@ export function defaultConfig(): WeChatAcpConfig {
  * into { command, args }.
  */
 export function parseAgentCommand(agentStr: string): { command: string; args: string[] } {
-  const parts = agentStr.trim().split(/\s+/);
+  const parts = splitCommandLine(agentStr);
   if (parts.length === 0 || !parts[0]) {
     throw new Error("Agent command cannot be empty");
   }
@@ -140,6 +143,67 @@ export function parseAgentCommand(agentStr: string): { command: string; args: st
     command: parts[0],
     args: parts.slice(1),
   };
+}
+
+function splitCommandLine(commandLine: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quote: "\"" | "'" | null = null;
+  let escaping = false;
+
+  const pushCurrent = () => {
+    if (current.length > 0) {
+      parts.push(current);
+      current = "";
+    }
+  };
+
+  for (const char of commandLine.trim()) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else if (char === "\\" && quote === "\"") {
+        escaping = true;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      pushCurrent();
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (escaping) {
+    current += "\\";
+  }
+
+  if (quote) {
+    throw new Error(`Unterminated quoted argument in agent command: ${commandLine}`);
+  }
+
+  pushCurrent();
+  return parts;
 }
 
 export function resolveAgentSelection(

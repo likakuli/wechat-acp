@@ -96,6 +96,7 @@ export interface RefMessage {
 
 export interface MessageItem {
   type?: number;
+  message_id?: number | string;
   create_time_ms?: number;
   update_time_ms?: number;
   is_completed?: boolean;

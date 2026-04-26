@@ -12,6 +12,7 @@ export interface AgentProcessInfo {
   process: ChildProcess;
   connection: acp.ClientSideConnection;
   sessionId: string;
+  promptCapabilities?: acp.PromptCapabilities;
 }
 
 export async function spawnAgent(params: {
@@ -85,6 +86,7 @@ export async function spawnAgent(params: {
     process: proc,
     connection,
     sessionId: sessionResult.sessionId,
+    promptCapabilities: initResult.agentCapabilities?.promptCapabilities,
   };
 }
 

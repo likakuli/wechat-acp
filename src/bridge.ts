@@ -5,15 +5,17 @@
  * One bridge = one WeChat bot account → many users → many agent sessions.
  */
 
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type * as acp from "@agentclientprotocol/sdk";
 import { login, loadToken, type TokenData } from "./weixin/auth.js";
 import { startMonitor } from "./weixin/monitor.js";
 import { sendImageMessage, sendTextMessage, splitText } from "./weixin/send.js";
 import { sendTyping, getConfig } from "./weixin/api.js";
 import { TypingStatus, MessageType } from "./weixin/types.js";
-import type { WeixinMessage } from "./weixin/types.js";
+import type { MessageItem, WeixinMessage } from "./weixin/types.js";
 import { SessionManager } from "./acp/session.js";
 import type { AgentImage, AgentReply } from "./acp/client.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
@@ -22,10 +24,42 @@ import type { WeChatAcpConfig } from "./config.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 const DEFAULT_MAX_SEND_MESSAGES_PER_REPLY = 10;
+const DEFAULT_MESSAGE_BATCH_DELAY_MS = 2500;
+const DEFAULT_TEXT_MESSAGE_BATCH_DELAY_MS = 800;
+const QUOTED_MEDIA_CACHE_LIMIT_PER_USER = 100;
+const QUOTED_MEDIA_CACHE_TTL_MS = 24 * 60 * 60_000;
+const QUOTED_MEDIA_CACHE_FILE = "quoted-media-cache.json";
 
 interface PendingOverflowReply {
   textSegments: string[];
   images: AgentImage[];
+}
+
+interface PendingMessageBatch {
+  prompt: acp.ContentBlock[];
+  contextToken: string;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface CachedQuotedMedia {
+  item: MessageItem;
+  keys: Set<string>;
+  timestamps: number[];
+  cachedAt: number;
+  source: "memory" | "persisted";
+}
+
+interface SerializedQuotedMediaCacheEntry {
+  userId: string;
+  item: MessageItem;
+  keys: string[];
+  timestamps?: number[];
+  cachedAt: number;
+}
+
+interface SerializedQuotedMediaCache {
+  version: 1;
+  entries: SerializedQuotedMediaCacheEntry[];
 }
 
 export interface OutboundReplyPlan<TImage> {
@@ -45,6 +79,9 @@ export class WeChatAcpBridge {
   // Per-user typing ticket cache
   private typingTickets = new Map<string, { ticket: string; expiresAt: number }>();
   private pendingOverflowReplies = new Map<string, PendingOverflowReply>();
+  private pendingMessageBatches = new Map<string, PendingMessageBatch>();
+  private quotedMediaCache = new Map<string, CachedQuotedMedia[]>();
+  private quotedMediaCacheLoaded = false;
   private log: (msg: string) => void;
 
   constructor(config: WeChatAcpConfig, log?: (msg: string) => void) {
@@ -106,11 +143,12 @@ export class WeChatAcpBridge {
   async stop(): Promise<void> {
     this.log("Stopping bridge...");
     this.abortController.abort();
+    await this.flushPendingMessageBatches();
     await this.sessionManager?.stop();
     this.log("Bridge stopped");
   }
 
-  private handleMessage(msg: WeixinMessage): void {
+  private async handleMessage(msg: WeixinMessage): Promise<void> {
     // Only process user messages (not bot's own messages)
     if (msg.message_type !== MessageType.USER) return;
 
@@ -124,16 +162,11 @@ export class WeChatAcpBridge {
     this.log(`Message from ${userId}: ${this.previewMessage(msg)}`);
 
     if (this.shouldContinuePendingReply(userId, msg)) {
-      this.continuePendingReply(userId, contextToken).catch((err) => {
-        this.log(`Failed to continue pending reply for ${userId}: ${String(err)}`);
-      });
+      await this.continuePendingReply(userId, contextToken);
       return;
     }
 
-    // Convert and enqueue — fire-and-forget (don't block the poll loop)
-    this.enqueueMessage(msg, userId, contextToken).catch((err) => {
-      this.log(`Failed to enqueue message from ${userId}: ${String(err)}`);
-    });
+    await this.enqueueMessage(msg, userId, contextToken);
   }
 
   private async enqueueMessage(
@@ -141,13 +174,158 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
   ): Promise<void> {
+    this.rememberQuotedMediaCandidates(userId, msg);
+
     const prompt = await weixinMessageToPrompt(
       msg,
       this.config.wechat.cdnBaseUrl,
       this.log,
+      {
+        resolveQuotedMedia: (quoteItem) => this.resolveCachedQuotedMedia(userId, quoteItem),
+      },
     );
 
-    await this.sessionManager!.enqueue(userId, { prompt, contextToken });
+    this.queueMessageBatch(
+      userId,
+      contextToken,
+      prompt,
+      this.messageBatchDelayMsForMessage(msg),
+    );
+  }
+
+  private rememberQuotedMediaCandidates(userId: string, msg: WeixinMessage): void {
+    this.loadQuotedMediaCache();
+
+    const items = msg.item_list ?? [];
+    const mediaItems = items.filter((item) => hasImageMedia(item));
+    if (mediaItems.length === 0) return;
+
+    const now = Date.now();
+    const cache = (this.quotedMediaCache.get(userId) ?? [])
+      .filter((entry) => now - entry.cachedAt <= QUOTED_MEDIA_CACHE_TTL_MS);
+
+    for (const item of mediaItems) {
+      const keys = mediaCacheKeys(item, msg);
+      const timestamps = mediaCacheTimestamps(item, msg);
+      if (keys.length === 0 && timestamps.length === 0) continue;
+      cache.push({
+        item,
+        keys: new Set(keys),
+        timestamps,
+        cachedAt: now,
+        source: "memory",
+      });
+    }
+
+    this.quotedMediaCache.set(
+      userId,
+      cache.slice(-QUOTED_MEDIA_CACHE_LIMIT_PER_USER),
+    );
+    this.saveQuotedMediaCache();
+  }
+
+  private resolveCachedQuotedMedia(
+    userId: string,
+    quoteItem: MessageItem,
+  ): MessageItem | undefined {
+    this.loadQuotedMediaCache();
+
+    const keys = mediaCacheKeys(quoteItem);
+    const timestamps = mediaCacheTimestamps(quoteItem);
+    if (keys.length === 0 && timestamps.length === 0) return undefined;
+
+    const cache = this.quotedMediaCache.get(userId) ?? [];
+    const now = Date.now();
+    for (let index = cache.length - 1; index >= 0; index--) {
+      const entry = cache[index]!;
+      if (now - entry.cachedAt > QUOTED_MEDIA_CACHE_TTL_MS) continue;
+      if (keys.some((key) => entry.keys.has(key))) {
+        const source = entry.source === "persisted" ? "persisted cache" : "local cache";
+        this.log(`Resolved quoted media from ${source}`);
+        return entry.item;
+      }
+    }
+
+    if (keys.length > 0 || timestamps.length > 0) {
+      this.log(
+        `Quoted media cache miss: quoteKeys=${formatMediaCacheKeys(keys)}, ` +
+        `quoteTimes=${formatTimestamps(timestamps)}, ` +
+        `recentCache=${summarizeRecentMediaCache(cache, now)}`,
+      );
+    }
+
+    return undefined;
+  }
+
+  private loadQuotedMediaCache(): void {
+    if (this.quotedMediaCacheLoaded) return;
+    this.quotedMediaCacheLoaded = true;
+
+    const filePath = this.quotedMediaCachePath();
+    if (!fsSync.existsSync(filePath)) return;
+
+    try {
+      const raw = fsSync.readFileSync(filePath, "utf-8");
+      const parsed = JSON.parse(raw) as Partial<SerializedQuotedMediaCache>;
+      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) return;
+
+      const now = Date.now();
+      for (const entry of parsed.entries) {
+        if (!entry.userId || !entry.item || !Array.isArray(entry.keys)) continue;
+        if (!entry.keys.length) continue;
+        if (!Number.isFinite(entry.cachedAt) || now - entry.cachedAt > QUOTED_MEDIA_CACHE_TTL_MS) continue;
+
+        const cache = this.quotedMediaCache.get(entry.userId) ?? [];
+        cache.push({
+          item: entry.item,
+          keys: new Set(entry.keys),
+          timestamps: Array.isArray(entry.timestamps) ? entry.timestamps.filter(Number.isFinite) : [],
+          cachedAt: entry.cachedAt,
+          source: "persisted",
+        });
+        this.quotedMediaCache.set(entry.userId, cache.slice(-QUOTED_MEDIA_CACHE_LIMIT_PER_USER));
+      }
+    } catch (err) {
+      this.log(`Failed to load quoted media cache: ${String(err)}`);
+    }
+  }
+
+  private saveQuotedMediaCache(): void {
+    const now = Date.now();
+    const entries: SerializedQuotedMediaCacheEntry[] = [];
+
+    for (const [userId, cache] of this.quotedMediaCache) {
+      const fresh = cache
+        .filter((entry) => now - entry.cachedAt <= QUOTED_MEDIA_CACHE_TTL_MS)
+        .slice(-QUOTED_MEDIA_CACHE_LIMIT_PER_USER);
+      this.quotedMediaCache.set(userId, fresh);
+
+      for (const entry of fresh) {
+        if (entry.keys.size === 0) continue;
+        entries.push({
+          userId,
+          item: entry.item,
+          keys: [...entry.keys],
+          timestamps: entry.timestamps,
+          cachedAt: entry.cachedAt,
+        });
+      }
+    }
+
+    try {
+      fsSync.mkdirSync(this.config.storage.dir, { recursive: true });
+      fsSync.writeFileSync(
+        this.quotedMediaCachePath(),
+        JSON.stringify({ version: 1, entries } satisfies SerializedQuotedMediaCache),
+        { encoding: "utf-8", mode: 0o600 },
+      );
+    } catch (err) {
+      this.log(`Failed to save quoted media cache: ${String(err)}`);
+    }
+  }
+
+  private quotedMediaCachePath(): string {
+    return path.join(this.config.storage.dir, QUOTED_MEDIA_CACHE_FILE);
   }
 
   private async sendReply(userId: string, contextToken: string, reply: AgentReply): Promise<void> {
@@ -168,18 +346,19 @@ export class WeChatAcpBridge {
       this.config.wechat.maxSendMessagesPerReply,
     );
 
-    if (plan.overflowTextSegments.length > 0 || plan.overflowImages.length > 0) {
-      this.pendingOverflowReplies.set(userId, {
+    const nextPending = plan.overflowTextSegments.length > 0 || plan.overflowImages.length > 0
+      ? {
         textSegments: plan.overflowTextSegments,
         images: plan.overflowImages,
-      });
+      }
+      : null;
+
+    if (nextPending) {
       this.log(
         `Reply for ${userId} exceeds ${plan.maxSendMessages} WeChat messages; ` +
         `sending ${plan.textSegments.length} text segments, ${plan.images.length} images, ` +
         `holding ${plan.overflowTextSegments.length} text segments, ${plan.overflowImages.length} images`,
       );
-    } else {
-      this.pendingOverflowReplies.delete(userId);
     }
 
     for (let i = 0; i < plan.textSegments.length; i++) {
@@ -216,6 +395,7 @@ export class WeChatAcpBridge {
         this.log(`Sent image to ${userId}: ${i + 1}/${plan.images.length}, ${image.name ?? image.uri ?? image.mimeType} (${clientId})`);
       } catch (err) {
         this.log(`Failed to send image to ${userId}: ${String(err)}`);
+        throw err;
       }
     }
 
@@ -234,6 +414,12 @@ export class WeChatAcpBridge {
       }
     }
 
+    if (nextPending) {
+      this.pendingOverflowReplies.set(userId, nextPending);
+    } else {
+      this.pendingOverflowReplies.delete(userId);
+    }
+
     // Cancel typing indicator after reply is sent
     this.cancelTypingIndicator(userId, contextToken).catch(() => {});
   }
@@ -242,9 +428,87 @@ export class WeChatAcpBridge {
     const pending = this.pendingOverflowReplies.get(userId);
     if (!pending) return;
 
-    this.pendingOverflowReplies.delete(userId);
     this.log(`Continuing pending reply for ${userId}: ${pending.textSegments.length} text segments, ${pending.images.length} images`);
     await this.sendReplyParts(userId, contextToken, pending.textSegments, pending.images);
+  }
+
+  private queueMessageBatch(
+    userId: string,
+    contextToken: string,
+    prompt: acp.ContentBlock[],
+    delayMs: number,
+  ): void {
+    if (delayMs <= 0) {
+      this.sessionManager!.enqueue(userId, { prompt, contextToken }).catch((err) => {
+        this.log(`Failed to enqueue message from ${userId}: ${String(err)}`);
+      });
+      return;
+    }
+
+    const existing = this.pendingMessageBatches.get(userId);
+    if (existing) {
+      existing.prompt.push(...prompt);
+      existing.contextToken = contextToken;
+      if (existing.timer) clearTimeout(existing.timer);
+      existing.timer = this.createBatchTimer(userId, delayMs);
+      return;
+    }
+
+    this.pendingMessageBatches.set(userId, {
+      prompt: [...prompt],
+      contextToken,
+      timer: this.createBatchTimer(userId, delayMs),
+    });
+  }
+
+  private createBatchTimer(userId: string, delayMs: number): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      this.flushMessageBatch(userId).catch((err) => {
+        this.log(`Failed to flush message batch for ${userId}: ${String(err)}`);
+      });
+    }, delayMs);
+    timer.unref();
+    return timer;
+  }
+
+  private async flushMessageBatch(userId: string): Promise<void> {
+    const batch = this.pendingMessageBatches.get(userId);
+    if (!batch) return;
+    this.pendingMessageBatches.delete(userId);
+    if (batch.timer) clearTimeout(batch.timer);
+    await this.sessionManager!.enqueue(userId, {
+      prompt: batch.prompt,
+      contextToken: batch.contextToken,
+    });
+  }
+
+  private async flushPendingMessageBatches(): Promise<void> {
+    const userIds = [...this.pendingMessageBatches.keys()];
+    for (const userId of userIds) {
+      await this.flushMessageBatch(userId);
+    }
+  }
+
+  private messageBatchDelayMsForMessage(msg: WeixinMessage): number {
+    return hasDownloadableIncomingMedia(msg)
+      ? this.mediaMessageBatchDelayMs()
+      : this.textMessageBatchDelayMs();
+  }
+
+  private mediaMessageBatchDelayMs(): number {
+    return normalizeBatchDelay(
+      this.config.session.messageBatchDelayMs,
+      DEFAULT_MESSAGE_BATCH_DELAY_MS,
+    );
+  }
+
+  private textMessageBatchDelayMs(): number {
+    const configured = this.config.session.textMessageBatchDelayMs;
+    if (configured == null) {
+      const mediaDelayMs = this.mediaMessageBatchDelayMs();
+      return mediaDelayMs <= 0 ? 0 : DEFAULT_TEXT_MESSAGE_BATCH_DELAY_MS;
+    }
+    return normalizeBatchDelay(configured, DEFAULT_TEXT_MESSAGE_BATCH_DELAY_MS);
   }
 
   private async resolveAgentImage(image: AgentImage): Promise<{ buffer: Buffer; mimeType?: string; name?: string }> {
@@ -375,6 +639,11 @@ export function normalizeMaxSendMessagesPerReply(value: number | undefined): num
   return Math.max(2, Math.floor(value));
 }
 
+function normalizeBatchDelay(value: number | undefined, defaultValue: number): number {
+  if (value == null || !Number.isFinite(value)) return defaultValue;
+  return Math.max(0, Math.floor(value));
+}
+
 export function planOutboundReply<TImage>(
   textSegments: string[],
   images: TImage[],
@@ -451,6 +720,88 @@ function extractMessageText(msg: WeixinMessage): string {
     if (item.type === 3 && item.voice_item?.text) return item.voice_item.text;
   }
   return "";
+}
+
+function hasImageMedia(item: MessageItem): boolean {
+  return Boolean(
+    item.image_item?.media?.encrypt_query_param ||
+    item.image_item?.thumb_media?.encrypt_query_param,
+  );
+}
+
+function hasDownloadableIncomingMedia(msg: WeixinMessage): boolean {
+  return Boolean((msg.item_list ?? []).some((item) => (
+    hasImageMedia(item) ||
+    Boolean(item.video_item?.media?.encrypt_query_param) ||
+    Boolean(item.file_item?.media?.encrypt_query_param) ||
+    Boolean(item.voice_item?.media?.encrypt_query_param && !item.voice_item?.text)
+  )));
+}
+
+type MediaCacheKeySource = {
+  msg_id?: unknown;
+  msgId?: unknown;
+  message_id?: unknown;
+  messageId?: unknown;
+};
+
+function mediaCacheKeys(...sources: Array<MediaCacheKeySource | undefined>): string[] {
+  const keys = new Set<string>();
+  for (const source of sources) {
+    if (!source) continue;
+    addStableMediaKey(keys, "msg", source.msg_id ?? source.msgId);
+    addStableMediaKey(keys, "message", source.message_id ?? source.messageId);
+  }
+  return [...keys];
+}
+
+function addStableMediaKey(keys: Set<string>, prefix: string, value: unknown): void {
+  if (typeof value !== "string" && typeof value !== "number") return;
+  const normalized = String(value).trim();
+  if (!normalized) return;
+  keys.add(`${prefix}:${normalized}`);
+}
+
+function mediaCacheTimestamps(
+  ...sources: Array<Pick<MessageItem, "create_time_ms" | "update_time_ms"> | undefined>
+): number[] {
+  const timestamps = new Set<number>();
+  for (const source of sources) {
+    if (!source) continue;
+    for (const value of [source.create_time_ms, source.update_time_ms]) {
+      const timestamp = normalizeTimestamp(value);
+      if (timestamp != null) timestamps.add(timestamp);
+    }
+  }
+  return [...timestamps];
+}
+
+function normalizeTimestamp(value: unknown): number | null {
+  const timestamp = typeof value === "number" ? value
+    : typeof value === "string" ? Number(value)
+    : NaN;
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function formatMediaCacheKeys(keys: string[]): string {
+  if (keys.length === 0) return "none";
+  return keys.map((key) => {
+    if (key.startsWith("msg:")) return "msg:<present>";
+    if (key.startsWith("message:")) return "message:<present>";
+    return key;
+  }).join(",");
+}
+
+function formatTimestamps(timestamps: number[]): string {
+  return timestamps.length > 0 ? timestamps.join(",") : "none";
+}
+
+function summarizeRecentMediaCache(cache: CachedQuotedMedia[], now: number): string {
+  const entries = cache
+    .filter((entry) => now - entry.cachedAt <= QUOTED_MEDIA_CACHE_TTL_MS)
+    .slice(-3)
+    .map((entry) => `{keys=${formatMediaCacheKeys([...entry.keys])}; times=${formatTimestamps(entry.timestamps)}}`);
+  return entries.length > 0 ? entries.join("|") : "empty";
 }
 
 function stripDataPrefix(data: string): string {

@@ -7,6 +7,7 @@
  */
 
 import fs from "node:fs";
+import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 
 export interface AgentImage {
@@ -22,6 +23,7 @@ export interface AgentReply {
 }
 
 export interface WeChatAcpClientOpts {
+  rootDir?: string;
   sendTyping: () => Promise<void>;
   onThoughtFlush: (text: string) => Promise<void>;
   log: (msg: string) => void;
@@ -34,11 +36,14 @@ export class WeChatAcpClient implements acp.Client {
   private images: AgentImage[] = [];
   private imageKeys = new Set<string>();
   private opts: WeChatAcpClientOpts;
+  private rootDir: string;
+  private rootRealPath: Promise<string> | null = null;
   private lastTypingAt = 0;
   private static readonly TYPING_INTERVAL_MS = 5_000;
 
   constructor(opts: WeChatAcpClientOpts) {
     this.opts = opts;
+    this.rootDir = path.resolve(opts.rootDir ?? process.cwd());
   }
 
   updateCallbacks(callbacks: { sendTyping: () => Promise<void>; onThoughtFlush: (text: string) => Promise<void> }): void {
@@ -139,7 +144,8 @@ export class WeChatAcpClient implements acp.Client {
 
   async readTextFile(params: acp.ReadTextFileRequest): Promise<acp.ReadTextFileResponse> {
     try {
-      const content = await fs.promises.readFile(params.path, "utf-8");
+      const filePath = await this.resolveReadablePath(params.path);
+      const content = await fs.promises.readFile(filePath, "utf-8");
       return { content };
     } catch (err) {
       throw new Error(`Failed to read file ${params.path}: ${String(err)}`);
@@ -148,7 +154,8 @@ export class WeChatAcpClient implements acp.Client {
 
   async writeTextFile(params: acp.WriteTextFileRequest): Promise<acp.WriteTextFileResponse> {
     try {
-      await fs.promises.writeFile(params.path, params.content, "utf-8");
+      const filePath = await this.resolveWritablePath(params.path);
+      await fs.promises.writeFile(filePath, params.content, "utf-8");
       return {};
     } catch (err) {
       throw new Error(`Failed to write file ${params.path}: ${String(err)}`);
@@ -242,6 +249,43 @@ export class WeChatAcpClient implements acp.Client {
     this.images.push(image);
     const label = image.name ?? image.uri ?? image.mimeType;
     this.opts.log(`[image] queued ${label.length > 100 ? label.substring(0, 100) + "..." : label}`);
+  }
+
+  private async resolveReadablePath(requestPath: string): Promise<string> {
+    const targetPath = path.resolve(this.rootDir, requestPath);
+    const realPath = await fs.promises.realpath(targetPath);
+    await this.assertWithinRoot(realPath);
+    return realPath;
+  }
+
+  private async resolveWritablePath(requestPath: string): Promise<string> {
+    const targetPath = path.resolve(this.rootDir, requestPath);
+
+    try {
+      const existingRealPath = await fs.promises.realpath(targetPath);
+      await this.assertWithinRoot(existingRealPath);
+      return existingRealPath;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+
+    const parentRealPath = await fs.promises.realpath(path.dirname(targetPath));
+    await this.assertWithinRoot(parentRealPath);
+    return targetPath;
+  }
+
+  private async assertWithinRoot(realPath: string): Promise<void> {
+    const root = await this.getRootRealPath();
+    const relative = path.relative(root, realPath);
+    if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+      return;
+    }
+    throw new Error(`Path is outside allowed root ${root}: ${realPath}`);
+  }
+
+  private getRootRealPath(): Promise<string> {
+    this.rootRealPath ??= fs.promises.realpath(this.rootDir);
+    return this.rootRealPath;
   }
 }
 

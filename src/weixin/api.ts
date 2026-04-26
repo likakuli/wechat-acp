@@ -100,7 +100,7 @@ async function apiPost<T>(
   } catch (err) {
     clearTimeout(timer);
     if ((err as Error).name === "AbortError") {
-      return { ret: 0, msgs: [] } as T;
+      throw new Error(`${endpoint} timed out after ${timeoutMs}ms`, { cause: err });
     }
     throw err;
   }

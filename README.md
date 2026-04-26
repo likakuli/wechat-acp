@@ -80,6 +80,8 @@ Options:
 - `--config <file>`: load JSON config file
 - `--idle-timeout <minutes>`: session idle timeout, default `1440` (use `0` for unlimited)
 - `--max-sessions <count>`: maximum concurrent user sessions, default `10`
+- `--message-batch-delay <ms>`: batch media-led messages from the same user into one agent prompt, default `2500` (use `0` to disable batching)
+- `--text-batch-delay <ms>`: batch nearby text messages from the same user, default `800`
 - `--max-send-messages <count>`: maximum WeChat `sendmessage` calls per reply, default `10`
 - `--show-thoughts`: forward agent thinking to WeChat (default: off)
 - `-h, --help`: show help
@@ -107,7 +109,9 @@ Example:
   },
   "session": {
     "idleTimeoutMs": 86400000,
-    "maxConcurrentUsers": 10
+    "maxConcurrentUsers": 10,
+    "messageBatchDelayMs": 2500,
+    "textMessageBatchDelayMs": 800
   },
   "wechat": {
     "maxSendMessagesPerReply": 10
@@ -136,7 +140,9 @@ You can also override or add agent presets:
 ## Runtime Behavior
 
 - Each WeChat user gets a dedicated ACP session and subprocess.
-- Messages are processed serially per user.
+- Nearby messages from the same user are batched into one ACP prompt, then prompts are processed serially per user. Media-led batches use the longer `messageBatchDelayMs` window so captions can arrive; text-only batches use the shorter `textMessageBatchDelayMs` window.
+- Text quotes are included in the ACP prompt when iLink includes quoted text in `ref_msg`.
+- Image quotes are attached when iLink includes `ref_msg.message_item.image_item` media, or when a stable `msg_id`/`message_id` can be resolved from the local quoted media cache.
 - Replies are formatted for WeChat before sending.
 - Typing indicators are sent when supported by the WeChat API.
 - Sessions are cleaned up after inactivity (set `idleTimeoutMs` to `0` to disable idle cleanup).
@@ -155,6 +161,7 @@ This directory is used for:
 - daemon pid file
 - daemon log file
 - sync state
+- quoted media cache for images previously seen by the bridge
 
 ## Current Limitations
 
@@ -162,6 +169,7 @@ This directory is used for:
 - MCP servers are not used
 - Permission requests are auto-approved
 - Agent communication is subprocess-only over stdio
+- Historical quoted images cannot be recovered when iLink only returns quote metadata and the bridge has no cached stable message id for the original image.
 - Some preset agents may require separate authentication before they can respond successfully
 
 ## Development

@@ -8,7 +8,11 @@
 import type { ChildProcess } from "node:child_process";
 import type * as acp from "@agentclientprotocol/sdk";
 import { WeChatAcpClient, type AgentReply } from "./client.js";
-import { spawnAgent, killAgent, type AgentProcessInfo } from "./agent-manager.js";
+import {
+  spawnAgent as spawnAgentProcess,
+  killAgent as killAgentProcess,
+  type AgentProcessInfo,
+} from "./agent-manager.js";
 
 export interface PendingMessage {
   prompt: acp.ContentBlock[];
@@ -34,6 +38,8 @@ export interface SessionManagerOpts {
   idleTimeoutMs: number;
   maxConcurrentUsers: number;
   showThoughts: boolean;
+  spawnAgent?: typeof spawnAgentProcess;
+  killAgent?: typeof killAgentProcess;
   log: (msg: string) => void;
   onReply: (userId: string, contextToken: string, reply: AgentReply) => Promise<void>;
   sendTyping: (userId: string, contextToken: string) => Promise<void>;
@@ -41,6 +47,7 @@ export interface SessionManagerOpts {
 
 export class SessionManager {
   private sessions = new Map<string, UserSession>();
+  private creatingSessions = new Map<string, Promise<UserSession>>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private opts: SessionManagerOpts;
   private aborted = false;
@@ -62,9 +69,19 @@ export class SessionManager {
       this.cleanupTimer = null;
     }
     // Kill all agent processes
+    for (const [userId, creating] of this.creatingSessions) {
+      creating
+        .then((session) => {
+          this.opts.log(`Stopping session for ${userId}`);
+          this.killAgent(session.agentInfo.process);
+        })
+        .catch(() => {});
+    }
+    this.creatingSessions.clear();
+
     for (const [userId, session] of this.sessions) {
       this.opts.log(`Stopping session for ${userId}`);
-      killAgent(session.agentInfo.process);
+      this.killAgent(session.agentInfo.process);
     }
     this.sessions.clear();
   }
@@ -73,13 +90,7 @@ export class SessionManager {
     let session = this.sessions.get(userId);
 
     if (!session) {
-      if (this.sessions.size >= this.opts.maxConcurrentUsers) {
-        // Evict oldest idle session
-        this.evictOldest();
-      }
-
-      session = await this.createSession(userId, message.contextToken);
-      this.sessions.set(userId, session);
+      session = await this.getOrCreateSession(userId, message.contextToken);
     }
 
     // Always update contextToken to the latest
@@ -108,12 +119,14 @@ export class SessionManager {
     this.opts.log(`Creating new session for ${userId}`);
 
     const client = new WeChatAcpClient({
+      rootDir: this.opts.agentCwd,
       sendTyping: () => this.opts.sendTyping(userId, contextToken),
       onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, { text, images: [] }),
       log: (msg) => this.opts.log(`[${userId}] ${msg}`),
       showThoughts: this.opts.showThoughts,
     });
 
+    const spawnAgent = this.opts.spawnAgent ?? spawnAgentProcess;
     const agentInfo = await spawnAgent({
       command: this.opts.agentCommand,
       args: this.opts.agentArgs,
@@ -144,6 +157,42 @@ export class SessionManager {
     };
   }
 
+  private async getOrCreateSession(userId: string, contextToken: string): Promise<UserSession> {
+    const existing = this.sessions.get(userId);
+    if (existing) return existing;
+
+    const creating = this.creatingSessions.get(userId);
+    if (creating) return creating;
+
+    if (!Number.isFinite(this.opts.maxConcurrentUsers) || this.opts.maxConcurrentUsers < 1) {
+      throw new Error(`Invalid maxConcurrentUsers: ${this.opts.maxConcurrentUsers}`);
+    }
+
+    if (this.sessions.size + this.creatingSessions.size >= this.opts.maxConcurrentUsers) {
+      // Evict oldest idle session
+      this.evictOldest();
+      if (this.sessions.size + this.creatingSessions.size >= this.opts.maxConcurrentUsers) {
+        throw new Error(`Maximum concurrent sessions reached (${this.opts.maxConcurrentUsers})`);
+      }
+    }
+
+    const promise = this.createSession(userId, contextToken)
+      .then((session) => {
+        if (this.aborted) {
+          this.killAgent(session.agentInfo.process);
+          throw new Error("Session manager stopped");
+        }
+        this.sessions.set(userId, session);
+        return session;
+      })
+      .finally(() => {
+        this.creatingSessions.delete(userId);
+      });
+
+    this.creatingSessions.set(userId, promise);
+    return promise;
+  }
+
   private async processQueue(session: UserSession): Promise<void> {
     try {
       while (session.queue.length > 0 && !this.aborted) {
@@ -164,9 +213,13 @@ export class SessionManager {
 
           // Send ACP prompt
           this.opts.log(`[${session.userId}] Sending prompt to agent...`);
+          const prompt = adaptPromptForAgent(
+            pending.prompt,
+            session.agentInfo.promptCapabilities,
+          );
           const result = await session.agentInfo.connection.prompt({
             sessionId: session.agentInfo.sessionId,
-            prompt: pending.prompt,
+            prompt,
           });
 
           // Collect accumulated text
@@ -220,7 +273,7 @@ export class SessionManager {
     for (const [userId, session] of this.sessions) {
       if (now - session.lastActivity > this.opts.idleTimeoutMs && !session.processing) {
         this.opts.log(`Session for ${userId} idle for ${Math.round((now - session.lastActivity) / 60_000)}min, removing`);
-        killAgent(session.agentInfo.process);
+        this.killAgent(session.agentInfo.process);
         this.sessions.delete(userId);
       }
     }
@@ -236,8 +289,56 @@ export class SessionManager {
     if (oldest) {
       this.opts.log(`Evicting oldest idle session: ${oldest.userId}`);
       const session = this.sessions.get(oldest.userId);
-      if (session) killAgent(session.agentInfo.process);
+      if (session) this.killAgent(session.agentInfo.process);
       this.sessions.delete(oldest.userId);
     }
   }
+
+  private killAgent(proc: ChildProcess): void {
+    const killAgent = this.opts.killAgent ?? killAgentProcess;
+    killAgent(proc);
+  }
+}
+
+function adaptPromptForAgent(
+  prompt: acp.ContentBlock[],
+  capabilities: acp.PromptCapabilities | undefined,
+): acp.ContentBlock[] {
+  const supportsImage = capabilities?.image === true;
+  const supportsAudio = capabilities?.audio === true;
+  const supportsEmbeddedContext = capabilities?.embeddedContext === true;
+
+  return prompt.map((block) => {
+    if (block.type === "image" && !supportsImage) {
+      return {
+        type: "text",
+        text: `[Received image (${block.mimeType}) - image prompts are not supported by selected agent]`,
+      };
+    }
+
+    if (block.type === "audio" && !supportsAudio) {
+      return {
+        type: "text",
+        text: `[Received audio (${block.mimeType}) - audio prompts are not supported by selected agent]`,
+      };
+    }
+
+    if (block.type === "resource" && !supportsEmbeddedContext) {
+      const resource = block.resource;
+      if ("text" in resource) {
+        return {
+          type: "text",
+          text: resource.text,
+        };
+      }
+      return {
+        type: "resource_link",
+        uri: resource.uri,
+        name: resource.uri,
+        mimeType: resource.mimeType,
+      };
+    }
+
+    return block;
+  });
 }

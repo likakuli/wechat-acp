@@ -49,6 +49,10 @@ Options:
   --idle-timeout <m>  Session idle timeout in minutes (default: 1440)
                       Use 0 to disable idle cleanup
   --max-sessions <n>  Max concurrent user sessions (default: 10)
+  --message-batch-delay <ms>
+                      Milliseconds to batch media-led messages from one user (default: 2500)
+  --text-batch-delay <ms>
+                      Milliseconds to batch nearby text messages (default: 800)
   --max-send-messages <n>
                       Max WeChat sendmessage calls per reply (default: 10)
   --show-thoughts     Forward agent thinking to WeChat (default: off)
@@ -66,6 +70,8 @@ function parseArgs(argv: string[]): {
   configFile?: string;
   idleTimeout?: number;
   maxSessions?: number;
+  messageBatchDelayMs?: number;
+  textMessageBatchDelayMs?: number;
   maxSendMessagesPerReply?: number;
   showThoughts: boolean;
   verbose: boolean;
@@ -111,6 +117,12 @@ function parseArgs(argv: string[]): {
         break;
       case "--max-sessions":
         result.maxSessions = parseInt(args[++i], 10);
+        break;
+      case "--message-batch-delay":
+        result.messageBatchDelayMs = parseInt(args[++i], 10);
+        break;
+      case "--text-batch-delay":
+        result.textMessageBatchDelayMs = parseInt(args[++i], 10);
         break;
       case "--max-send-messages":
         result.maxSendMessagesPerReply = parseInt(args[++i], 10);
@@ -288,7 +300,33 @@ async function main(): Promise<void> {
     }
     config.session.idleTimeoutMs = args.idleTimeout * 60_000;
   }
-  if (args.maxSessions) config.session.maxConcurrentUsers = args.maxSessions;
+  if (args.maxSessions !== undefined) {
+    if (!Number.isInteger(args.maxSessions) || args.maxSessions < 1) {
+      console.error("Error: invalid --max-sessions value");
+      console.error("Use an integer value >= 1.");
+      process.exit(1);
+    }
+    config.session.maxConcurrentUsers = args.maxSessions;
+  }
+  if (args.messageBatchDelayMs !== undefined) {
+    if (!Number.isInteger(args.messageBatchDelayMs) || args.messageBatchDelayMs < 0) {
+      console.error("Error: invalid --message-batch-delay value");
+      console.error("Use a non-negative integer millisecond value, where 0 disables batching.");
+      process.exit(1);
+    }
+    config.session.messageBatchDelayMs = args.messageBatchDelayMs;
+    if (args.messageBatchDelayMs === 0 && args.textMessageBatchDelayMs === undefined) {
+      config.session.textMessageBatchDelayMs = 0;
+    }
+  }
+  if (args.textMessageBatchDelayMs !== undefined) {
+    if (!Number.isInteger(args.textMessageBatchDelayMs) || args.textMessageBatchDelayMs < 0) {
+      console.error("Error: invalid --text-batch-delay value");
+      console.error("Use a non-negative integer millisecond value, where 0 disables text-message batching.");
+      process.exit(1);
+    }
+    config.session.textMessageBatchDelayMs = args.textMessageBatchDelayMs;
+  }
   if (args.maxSendMessagesPerReply !== undefined) {
     if (!Number.isFinite(args.maxSendMessagesPerReply) || args.maxSendMessagesPerReply < 2) {
       console.error("Error: invalid --max-send-messages value");

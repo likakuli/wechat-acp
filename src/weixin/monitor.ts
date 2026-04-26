@@ -21,7 +21,7 @@ export interface MonitorOpts {
   abortSignal?: AbortSignal;
   longPollTimeoutMs?: number;
   log: (msg: string) => void;
-  onMessage: (msg: WeixinMessage) => void;
+  onMessage: (msg: WeixinMessage) => void | Promise<void>;
 }
 
 function getSyncBufPath(storageDir: string): string {
@@ -108,13 +108,13 @@ export async function startMonitor(opts: MonitorOpts): Promise<void> {
 
       consecutiveFailures = 0;
 
+      for (const msg of resp.msgs ?? []) {
+        await onMessage(msg);
+      }
+
       if (resp.get_updates_buf != null && resp.get_updates_buf !== "") {
         saveSyncBuf(storageDir, resp.get_updates_buf);
         getUpdatesBuf = resp.get_updates_buf;
-      }
-
-      for (const msg of resp.msgs ?? []) {
-        onMessage(msg);
       }
     } catch (err) {
       if (abortSignal?.aborted) return;
