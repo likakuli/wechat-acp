@@ -1,6 +1,6 @@
 {
   "name": "@likakuli/wechat-acp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Bridge WeChat to any ACP-compatible AI agent",
   "type": "module",
   "files": [
